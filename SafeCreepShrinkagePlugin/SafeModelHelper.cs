@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
-using System.Reflection;
+using System.Globalization;
+using System.Linq;
 using System.Text;
 using SAFEv1;
 
@@ -24,7 +25,7 @@ namespace SafeCreepShrinkagePlugin
     /// <summary>Các tiện ích làm việc với cSapModel của SAFE.</summary>
     public static class SafeModelHelper
     {
-        /// <summary>Lấy danh sách load case (dùng OAPI GetNameList - đáng tin cậy).</summary>
+        /// <summary>Lấy danh sách load case (dùng OAPI GetNameList).</summary>
         public static List<LoadCaseInfo> GetLoadCases(cSapModel model)
         {
             var list = new List<LoadCaseInfo>();
@@ -38,10 +39,7 @@ namespace SafeCreepShrinkagePlugin
                 foreach (var n in names)
                     list.Add(new LoadCaseInfo { Name = n, LikelyLongTerm = IsLikelyLongTerm(n) });
             }
-            catch
-            {
-                // nếu OAPI đổi chữ ký, trả danh sách rỗng để UI báo.
-            }
+            catch { }
             return list;
         }
 
@@ -54,13 +52,31 @@ namespace SafeCreepShrinkagePlugin
                 || s.Contains("dai han") || s.Contains("dài hạn");
         }
 
+        /// <summary>Liệt kê toàn bộ bảng database để chẩn đoán (key | name).</summary>
+        public static string ListTables(cSapModel model)
+        {
+            var sb = new StringBuilder();
+            if (model == null) return "cSapModel null";
+            try
+            {
+                cDatabaseTables db = model.DatabaseTables;
+                int n = 0; string[] keys = null, names = null; int[] it = null;
+                int ret = db.GetAllTables(ref n, ref keys, ref names, ref it);
+                if (ret != 0 || keys == null) return "Không lấy được danh sách bảng (GetAllTables=" + ret + ").";
+                sb.AppendLine("Tổng " + keys.Length + " bảng:");
+                for (int i = 0; i < keys.Length; i++)
+                    sb.AppendLine("- " + keys[i] + ((names != null && i < names.Length) ? "  |  " + names[i] : ""));
+            }
+            catch (Exception ex) { sb.AppendLine("Lỗi: " + ex.Message); }
+            return sb.ToString();
+        }
+
         /// <summary>
-        /// Cố gắng ghi Creep / Shrinkage / Aging vào một load case qua OAPI bằng reflection.
-        /// OAPI của SAFE không phải lúc nào cũng phơi bày các tham số này, nên hàm
-        /// dò các phương thức Set...Crack/Creep/Shrink/LongTerm và gọi nếu chữ ký phù hợp.
+        /// Ghi Creep / Shrinkage / Aging vào các load case qua Interactive Database Editing.
+        /// Dò bảng có cột chứa 'creep'/'shrink'/'aging', sửa các dòng trùng tên case, rồi Apply.
         /// </summary>
-        public static ApplyResult TryApplyCreepShrinkage(cSapModel model, string caseName,
-            double creep, double shrinkage, double aging)
+        public static ApplyResult ApplyViaDatabase(cSapModel model, List<string> caseNames,
+            double creep, double shrink, double aging)
         {
             var res = new ApplyResult();
             var sb = new StringBuilder();
@@ -68,76 +84,108 @@ namespace SafeCreepShrinkagePlugin
 
             try
             {
-                object loadCases = model.LoadCases;
-                var targets = new List<object> { loadCases };
-                foreach (var p in loadCases.GetType().GetProperties())
+                cDatabaseTables db = model.DatabaseTables;
+                int numTables = 0;
+                string[] keys = null, names = null;
+                int[] importType = null;
+                int ret = db.GetAllTables(ref numTables, ref keys, ref names, ref importType);
+                if (ret != 0 || keys == null)
                 {
-                    try { var v = p.GetValue(loadCases, null); if (v != null) targets.Add(v); }
-                    catch { }
+                    res.Log = "Không lấy được danh sách bảng (GetAllTables=" + ret + ").";
+                    return res;
                 }
 
-                foreach (var target in targets)
+                // Ưu tiên các bảng có tên liên quan; nếu không có thì quét toàn bộ.
+                var candidates = new List<int>();
+                for (int i = 0; i < keys.Length; i++)
                 {
-                    foreach (var m in target.GetType().GetMethods())
+                    string nm = ((names != null && i < names.Length) ? names[i] : keys[i] ?? "").ToLowerInvariant();
+                    string ky = (keys[i] ?? "").ToLowerInvariant();
+                    if (nm.Contains("load case") || nm.Contains("crack") || nm.Contains("creep")
+                        || ky.Contains("crack") || ky.Contains("creep") || ky.Contains("loadcase"))
+                        candidates.Add(i);
+                }
+                if (candidates.Count == 0)
+                    for (int i = 0; i < keys.Length; i++) candidates.Add(i);
+
+                foreach (int idx in candidates)
+                {
+                    string tableKey = keys[idx];
+                    string groupName = "";
+                    int tableVersion = 0, numFields = 0, numRecords = 0;
+                    string[] fieldKeys = null, data = null;
+                    try
                     {
-                        string mn = m.Name.ToLowerInvariant();
-                        bool relevant = mn.StartsWith("set") &&
-                            (mn.Contains("crack") || mn.Contains("creep") || mn.Contains("shrink")
-                             || mn.Contains("longterm") || mn.Contains("timedep"));
-                        if (!relevant) continue;
+                        int r2 = db.GetTableForEditingArray(ref tableKey, ref groupName, ref tableVersion,
+                            ref numFields, ref fieldKeys, ref numRecords, ref data);
+                        if (r2 != 0 || fieldKeys == null || data == null || numFields <= 0) continue;
+                    }
+                    catch { continue; }
 
-                        var ps = m.GetParameters();
-                        if (ps.Length == 0 || ps[0].ParameterType != typeof(string))
-                        {
-                            sb.AppendLine("Bỏ qua (không nhận tên case): " + target.GetType().Name + "." + m.Name);
-                            continue;
-                        }
+                    int creepCol = FindField(fieldKeys, "creep");
+                    int shrinkCol = FindField(fieldKeys, "shrink");
+                    int agingCol = FindField(fieldKeys, "aging", "age");
+                    if (creepCol < 0 && shrinkCol < 0) continue; // không phải bảng cần tìm
 
-                        object[] args = new object[ps.Length];
-                        args[0] = caseName;
-                        for (int i = 1; i < ps.Length; i++)
-                        {
-                            var pt = ps[i].ParameterType;
-                            string pn = (ps[i].Name ?? "").ToLowerInvariant();
-                            if (pt == typeof(double) || pt == typeof(float))
-                            {
-                                if (pn.Contains("creep")) args[i] = creep;
-                                else if (pn.Contains("shrink")) args[i] = shrinkage;
-                                else if (pn.Contains("age") || pn.Contains("aging")) args[i] = aging;
-                                else args[i] = 0.0;
-                            }
-                            else if (pt == typeof(bool)) args[i] = true;
-                            else if (pt == typeof(int)) args[i] = 0;
-                            else if (pt == typeof(string)) args[i] = "";
-                            else args[i] = pt.IsValueType ? Activator.CreateInstance(pt) : null;
-                        }
+                    int caseCol = FindField(fieldKeys, "case", "name");
+                    if (caseCol < 0) caseCol = 0;
 
-                        try
-                        {
-                            object ret = m.Invoke(target, args);
-                            int code = (ret is int) ? (int)ret : 0;
-                            sb.AppendLine("Gọi " + target.GetType().Name + "." + m.Name + " -> mã " + code);
-                            if (code == 0) { res.Success = true; res.MethodUsed = target.GetType().Name + "." + m.Name; }
-                        }
-                        catch (Exception ex)
-                        {
-                            var inner = ex.InnerException != null ? ex.InnerException.Message : ex.Message;
-                            sb.AppendLine("Gọi " + m.Name + " thất bại: " + inner);
-                        }
+                    sb.AppendLine("Bảng khớp: " + tableKey);
+                    sb.AppendLine("Cột: " + string.Join(", ", fieldKeys));
+
+                    int updated = 0;
+                    for (int rIdx = 0; rIdx < numRecords; rIdx++)
+                    {
+                        int baseI = rIdx * numFields;
+                        if (baseI + numFields > data.Length) break;
+                        string cn = data[baseI + caseCol];
+                        if (cn == null) continue;
+                        if (!caseNames.Any(x => string.Equals(x, cn, StringComparison.OrdinalIgnoreCase))) continue;
+                        if (creepCol >= 0) data[baseI + creepCol] = creep.ToString(CultureInfo.InvariantCulture);
+                        if (shrinkCol >= 0) data[baseI + shrinkCol] = shrink.ToString(CultureInfo.InvariantCulture);
+                        if (agingCol >= 0) data[baseI + agingCol] = aging.ToString(CultureInfo.InvariantCulture);
+                        updated++;
+                    }
+
+                    if (updated == 0)
+                    {
+                        sb.AppendLine("Không có dòng nào khớp tên case trong bảng này.");
+                        continue;
+                    }
+
+                    int r3 = db.SetTableForEditingArray(ref tableKey, ref tableVersion, ref fieldKeys, ref numRecords, ref data);
+                    int nFatal = 0, nErr = 0, nWarn = 0, nInfo = 0; string importLog = "";
+                    int r4 = db.ApplyEditedTables(true, ref nFatal, ref nErr, ref nWarn, ref nInfo, ref importLog);
+                    sb.AppendLine("Cập nhật " + updated + " dòng. Set=" + r3 + ", Apply=" + r4 +
+                                  " (Fatal=" + nFatal + ", Err=" + nErr + ", Warn=" + nWarn + ")");
+                    if (!string.IsNullOrWhiteSpace(importLog)) sb.AppendLine(importLog.Trim());
+
+                    if (r3 == 0 && r4 == 0 && nFatal == 0 && nErr == 0)
+                    {
+                        res.Success = true;
+                        res.MethodUsed = "DatabaseTables: " + tableKey;
+                        break;
                     }
                 }
 
-                if (!res.Success)
-                    sb.AppendLine("Không gọi thành công phương thức OAPI nào cho tham số cracking long-term. " +
-                                  "Hãy nhập tay giá trị bên dưới vào hộp thoại Load Case Data.");
+                if (!res.Success && sb.Length == 0)
+                    sb.AppendLine("Không tìm thấy bảng nào chứa cột creep/shrinkage. " +
+                                  "Hãy bấm 'Liệt kê bảng' và gửi log để xác định đúng bảng.");
             }
-            catch (Exception ex)
-            {
-                sb.AppendLine("Lỗi: " + ex.Message);
-            }
+            catch (Exception ex) { sb.AppendLine("Lỗi: " + ex.Message); }
 
             res.Log = sb.ToString();
             return res;
+        }
+
+        private static int FindField(string[] fields, params string[] kws)
+        {
+            for (int i = 0; i < fields.Length; i++)
+            {
+                string f = (fields[i] ?? "").ToLowerInvariant();
+                foreach (var k in kws) if (f.Contains(k)) return i;
+            }
+            return -1;
         }
     }
 }
