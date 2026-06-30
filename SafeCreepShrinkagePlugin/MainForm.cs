@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Drawing;
 using System.Globalization;
 using System.Text;
@@ -88,11 +89,14 @@ namespace SafeCreepShrinkagePlugin
             Controls.Add(grpLog);
 
             // ----- Nút dưới -----
-            var btnCopy = new Button { Text = "Copy giá trị", Left = 404, Top = 552, Width = 130, Height = 32 };
+            var btnCopy = new Button { Text = "Copy giá trị", Left = 404, Top = 552, Width = 120, Height = 32 };
             btnCopy.Click += (s, e) => CopyValues();
-            var btnClose = new Button { Text = "Đóng", Left = 678, Top = 552, Width = 130, Height = 32 };
+            var btnTables = new Button { Text = "Liệt kê bảng", Left = 532, Top = 552, Width = 130, Height = 32 };
+            btnTables.Click += (s, e) => ShowTables();
+            var btnClose = new Button { Text = "Đóng", Left = 688, Top = 552, Width = 120, Height = 32 };
             btnClose.Click += (s, e) => Close();
             Controls.Add(btnCopy);
+            Controls.Add(btnTables);
             Controls.Add(btnClose);
         }
 
@@ -191,23 +195,23 @@ namespace SafeCreepShrinkagePlugin
             try { aging = ParseNum(txtAging, "aging"); }
             catch (Exception ex) { MessageBox.Show(ex.Message, "Lỗi"); return; }
 
-            double creep = _last.Phi;
-            double shrink = _last.EpsCs;
+            var names = new List<string>();
+            foreach (var item in clbCases.CheckedItems) names.Add(item.ToString());
+
+            var res = SafeModelHelper.ApplyViaDatabase(_model, names, _last.Phi, _last.EpsCs, aging);
             var sb = new StringBuilder();
-            int okCount = 0;
-            foreach (var item in clbCases.CheckedItems)
-            {
-                string name = item.ToString();
-                var res = SafeModelHelper.TryApplyCreepShrinkage(_model, name, creep, shrink, aging);
-                sb.AppendLine("[" + name + "] " + (res.Success ? "OK (" + res.MethodUsed + ")" : "chưa ghi được"));
-                if (!string.IsNullOrEmpty(res.Log)) sb.AppendLine(res.Log.TrimEnd());
-                if (res.Success) okCount++;
-            }
+            sb.AppendLine(res.Success ? ("THÀNH CÔNG qua " + res.MethodUsed) : "CHƯ!A ghi được qua OAPI.");
+            if (!string.IsNullOrEmpty(res.Log)) sb.AppendLine(res.Log.TrimEnd());
             sb.AppendLine("---");
-            sb.AppendLine("Creep = " + creep.ToString("0.000") + " ; Shrinkage = " + shrink.ToString("0.000000") + " ; Aging = " + aging.ToString("0.00"));
-            if (okCount == 0)
-                sb.AppendLine("Lưu ý: OAPI không ghi được -> dùng nút Copy và nhập tay vào Load Case Data (Nonlinear Long Term Cracked).");
+            sb.AppendLine("Creep = " + _last.Phi.ToString("0.000") + " ; Shrinkage = " + _last.EpsCs.ToString("0.000000") + " ; Aging = " + aging.ToString("0.00"));
+            if (!res.Success)
+                sb.AppendLine("Nếu chưa ghi được: bấm 'Liệt kê bảng' và gửi log, hoặc dùng Copy để nhập tay vào Load Case Data (Nonlinear Long Term Cracked).");
             Log(sb.ToString());
+        }
+
+        private void ShowTables()
+        {
+            Log(SafeModelHelper.ListTables(_model));
         }
 
         private void CopyValues()
