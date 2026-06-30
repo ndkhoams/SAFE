@@ -52,7 +52,7 @@ namespace SafeCreepShrinkagePlugin
                 || s.Contains("dai han") || s.Contains("dài hạn");
         }
 
-        /// <summary>Liệt kê toàn bộ bảng database để chẩn đoán (key | name).</summary>
+        /// <summary>Liệt kê toàn bộ bảng database để chẩn đoán (key | name | empty?).</summary>
         public static string ListTables(cSapModel model)
         {
             var sb = new StringBuilder();
@@ -60,12 +60,16 @@ namespace SafeCreepShrinkagePlugin
             try
             {
                 cDatabaseTables db = model.DatabaseTables;
-                int n = 0; string[] keys = null, names = null; int[] it = null;
-                int ret = db.GetAllTables(ref n, ref keys, ref names, ref it);
+                int n = 0; string[] keys = null, names = null; int[] it = null; bool[] isEmpty = null;
+                int ret = db.GetAllTables(ref n, ref keys, ref names, ref it, ref isEmpty);
                 if (ret != 0 || keys == null) return "Không lấy được danh sách bảng (GetAllTables=" + ret + ").";
                 sb.AppendLine("Tổng " + keys.Length + " bảng:");
                 for (int i = 0; i < keys.Length; i++)
-                    sb.AppendLine("- " + keys[i] + ((names != null && i < names.Length) ? "  |  " + names[i] : ""));
+                {
+                    string nm = (names != null && i < names.Length) ? names[i] : "";
+                    string em = (isEmpty != null && i < isEmpty.Length && isEmpty[i]) ? "  (rỗng)" : "";
+                    sb.AppendLine("- " + keys[i] + (nm.Length > 0 ? "  |  " + nm : "") + em);
+                }
             }
             catch (Exception ex) { sb.AppendLine("Lỗi: " + ex.Message); }
             return sb.ToString();
@@ -88,7 +92,8 @@ namespace SafeCreepShrinkagePlugin
                 int numTables = 0;
                 string[] keys = null, names = null;
                 int[] importType = null;
-                int ret = db.GetAllTables(ref numTables, ref keys, ref names, ref importType);
+                bool[] isEmpty = null;
+                int ret = db.GetAllTables(ref numTables, ref keys, ref names, ref importType, ref isEmpty);
                 if (ret != 0 || keys == null)
                 {
                     res.Log = "Không lấy được danh sách bảng (GetAllTables=" + ret + ").";
@@ -99,6 +104,7 @@ namespace SafeCreepShrinkagePlugin
                 var candidates = new List<int>();
                 for (int i = 0; i < keys.Length; i++)
                 {
+                    if (isEmpty != null && i < isEmpty.Length && isEmpty[i]) continue; // bỏ bảng rỗng
                     string nm = ((names != null && i < names.Length) ? names[i] : keys[i] ?? "").ToLowerInvariant();
                     string ky = (keys[i] ?? "").ToLowerInvariant();
                     if (nm.Contains("load case") || nm.Contains("crack") || nm.Contains("creep")
@@ -106,22 +112,27 @@ namespace SafeCreepShrinkagePlugin
                         candidates.Add(i);
                 }
                 if (candidates.Count == 0)
-                    for (int i = 0; i < keys.Length; i++) candidates.Add(i);
+                    for (int i = 0; i < keys.Length; i++)
+                    {
+                        if (isEmpty != null && i < isEmpty.Length && isEmpty[i]) continue;
+                        candidates.Add(i);
+                    }
 
                 foreach (int idx in candidates)
                 {
                     string tableKey = keys[idx];
                     string groupName = "";
-                    int tableVersion = 0, numFields = 0, numRecords = 0;
+                    int tableVersion = 0, numRecords = 0;
                     string[] fieldKeys = null, data = null;
                     try
                     {
-                        int r2 = db.GetTableForEditingArray(ref tableKey, ref groupName, ref tableVersion,
-                            ref numFields, ref fieldKeys, ref numRecords, ref data);
-                        if (r2 != 0 || fieldKeys == null || data == null || numFields <= 0) continue;
+                        int r2 = db.GetTableForEditingArray(tableKey, groupName, ref tableVersion,
+                            ref fieldKeys, ref numRecords, ref data);
+                        if (r2 != 0 || fieldKeys == null || data == null || fieldKeys.Length == 0) continue;
                     }
                     catch { continue; }
 
+                    int numFields = fieldKeys.Length;
                     int creepCol = FindField(fieldKeys, "creep");
                     int shrinkCol = FindField(fieldKeys, "shrink");
                     int agingCol = FindField(fieldKeys, "aging", "age");
@@ -153,7 +164,7 @@ namespace SafeCreepShrinkagePlugin
                         continue;
                     }
 
-                    int r3 = db.SetTableForEditingArray(ref tableKey, ref tableVersion, ref fieldKeys, ref numRecords, ref data);
+                    int r3 = db.SetTableForEditingArray(tableKey, ref tableVersion, ref fieldKeys, numRecords, ref data);
                     int nFatal = 0, nErr = 0, nWarn = 0, nInfo = 0; string importLog = "";
                     int r4 = db.ApplyEditedTables(true, ref nFatal, ref nErr, ref nWarn, ref nInfo, ref importLog);
                     sb.AppendLine("Cập nhật " + updated + " dòng. Set=" + r3 + ", Apply=" + r4 +
